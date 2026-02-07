@@ -1,0 +1,4 @@
+# Server URL (আপনার সার্ভারের আইপি দিন)
+SERVER_URL=https://mtroom-server.koyeb.app
+# Authentication (PBSNet থেকে পাওয়া API Key)
+API_KEY=pbsnet-
