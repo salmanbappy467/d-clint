@@ -1,167 +1,255 @@
-// index.js
 require('dotenv').config();
-const io = require('socket.io-client');
-const fs = require('fs');
-const path = require('path');
+const { io } = require("socket.io-client");
+const fs = require("fs");
+const path = require("path");
 const crypto = require('crypto');
+const os = require('os');
 
-// কনফিগারেশন
-const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000"; // সার্ভারের আইপি
-const MACHINE_ID = process.env.MACHINE_ID || "PC-01";
-const API_KEY = process.env.API_KEY; // PBSNet API Key
+// ==========================================
+// 1. CONFIGURATION & SETUP
+// ==========================================
+
+const SERVER_URL = process.env.SERVER_URL || "http://localhost:8000"; 
+const API_KEY = process.env.API_KEY; 
+const TASK_TIMEOUT_MS = 5 * 60 * 1000; // টাস্ক টাইমআউট ৫ মিনিট
+
+// কনসোল কালার কোড
+const COLORS = {
+    RESET: "\x1b[0m",
+    RED: "\x1b[31m",
+    GREEN: "\x1b[32m",
+    YELLOW: "\x1b[33m",
+    BLUE: "\x1b[34m",
+    MAGENTA: "\x1b[35m",
+    CYAN: "\x1b[36m",
+    BG_RED: "\x1b[41m\x1b[37m"
+};
+
+// লগার হেল্পার
+const log = (type, msg) => {
+    const time = new Date().toLocaleTimeString();
+    console.log(`${time} ${type} ${msg}${COLORS.RESET}`);
+};
 
 if (!API_KEY) {
-    console.error("❌ Error: API_KEY is missing in .env file");
+    console.error(`${COLORS.BG_RED} ❌ ERROR ${COLORS.RESET} API_KEY missing in .env file`);
     process.exit(1);
 }
 
-// Logic File পাথ
-const LOGIC_PATH = path.join(__dirname, 'logic.js');
+const ID_FILE = path.join(__dirname, 'machine_id.txt');
+let MACHINE_ID = fs.existsSync(ID_FILE) ? fs.readFileSync(ID_FILE, 'utf8').trim() : '';
 
-// 1. সার্ভারে কানেকশন
-console.log(`🔌 Connecting to Server: ${SERVER_URL}`);
+const getSystemSpecs = () => ({
+    os: os.type() + ' ' + os.release(),
+    ram: Math.round(os.totalmem() / (1024 * 1024 * 1024)) + ' GB',
+    hostname: os.hostname(),
+    cores: os.cpus().length
+});
+
+// ==========================================
+// 2. SOCKET CONNECTION
+// ==========================================
+
 const socket = io(SERVER_URL, {
     query: { type: 'worker' },
     auth: { 
-        machineId: MACHINE_ID,
-        apiKey: API_KEY
+        machineId: MACHINE_ID, 
+        apiKey: API_KEY, 
+        config: getSystemSpecs() 
     },
     reconnection: true,
     reconnectionAttempts: Infinity,
-    reconnectionDelay: 2000
+    reconnectionDelay: 3000,
+    timeout: 20000,
+    transports: ["polling", "websocket"]
 });
 
-// 2. কানেকশন ইভেন্ট হ্যান্ডলার
-socket.on('connect', () => {
-    console.log(`✅ Connected as ${MACHINE_ID}`);
-    checkLogicVersion(); // কানেক্ট হলে লজিক ফাইল চেক করবে
-});
-
-socket.on('connect_error', (err) => {
-    console.log(`❌ Connection Error: ${err.message}`);
-});
-
-socket.on('disconnect', () => {
-    console.log("⚠️ Disconnected from server");
-});
-
-// 3. লজিক ফাইল সিঙ্কিং (Auto Update)
-function getLocalLogicHash() {
+function getLocalFileHash(fileName) {
+    const filePath = path.join(__dirname, fileName);
+    if (!fs.existsSync(filePath)) return null;
     try {
-        if (!fs.existsSync(LOGIC_PATH)) return null;
-        const content = fs.readFileSync(LOGIC_PATH);
-        return crypto.createHash('md5').update(content).digest('hex');
+        return crypto.createHash('md5').update(fs.readFileSync(filePath)).digest('hex');
     } catch (e) { return null; }
 }
 
-function checkLogicVersion() {
-    const hash = getLocalLogicHash();
-    socket.emit('check_version', hash); // সার্ভারকে হ্যাশ পাঠাবে
-}
+let pendingUpdates = 0;
 
-socket.on('update_logic_file', (data) => {
-    console.log("📥 Downloading new logic file from server...");
-    try {
-        fs.writeFileSync(LOGIC_PATH, data.content); // নতুন ফাইল সেভ
-        delete require.cache[require.resolve(LOGIC_PATH)]; // মেমোরি ক্লিয়ার
-        console.log("✅ Logic file updated successfully!");
-        socket.emit('logic_uptodate');
-        
-        // ফাইল আপডেট হলে ওয়ার্কার রেডি সিগন্যাল দিবে
-        socket.emit('worker_ready');
-    } catch (e) {
-        console.error("❌ Failed to update logic file:", e.message);
-    }
+// ==========================================
+// 3. EVENT LISTENERS
+// ==========================================
+
+socket.on('connect', () => {
+    log(COLORS.GREEN, `[STATUS] Connected! ID: ${MACHINE_ID || 'New Node'} | User: ${API_KEY.substring(0,6)}...`);
 });
 
-socket.on('logic_uptodate', () => {
-    console.log("⚡ Logic is up-to-date. Waiting for tasks...");
-    socket.emit('worker_ready'); // কাজ নিতে প্রস্তুত
-});
-
-
-// 4. টাস্ক এক্সিকিউশন (Task Handler)
-socket.on('execute_task', async (job) => {
-    console.log(`🚀 New Task Received: ${job.taskType} [ID: ${job.requestId}]`);
+// 🔥 NEW: Auth Error Handler (১ মিনিট ডিলে)
+socket.on('auth_error', (data) => {
+    log(COLORS.RED, `⛔ Auth Failed: ${data.message}`);
+    log(COLORS.YELLOW, `⏳ Waiting 1 minute before retrying...`);
     
-    // লজিক ফাইল লোড করা (ডাইনামিক)
-    let logic;
+    // অটো-রিকানেকশন লুপ থামানোর জন্য ম্যানুয়ালি ডিসকানেক্ট করা
+    socket.disconnect();
+
+    // ১ মিনিট (৬০,০০০ ms) পর আবার কানেক্ট করার চেষ্টা
+    setTimeout(() => {
+        log(COLORS.CYAN, `🔄 Retrying connection...`);
+        socket.connect();
+    }, 60 * 1000);
+});
+
+socket.on('save_machine_id', (data) => {
     try {
-        if (!fs.existsSync(LOGIC_PATH)) throw new Error("Logic file missing!");
-        logic = require('./logic.js');
-    } catch (e) {
-        return sendResult(job.requestId, { error: "Logic Module Error: " + e.message });
+        const newId = typeof data === 'object' ? data.newMachineId : data;
+        if (newId && newId !== "Pending...") {
+            fs.writeFileSync(ID_FILE, newId);
+            MACHINE_ID = newId;
+            log(COLORS.YELLOW, `💾 Registry Updated: ID assigned ${MACHINE_ID}`);
+        }
+    } catch (e) { console.error("❌ ID Save Error:", e); }
+});
+
+socket.on('disconnect', (reason) => {
+    if (reason === 'io client disconnect') {
+        // ম্যানুয়াল ডিসকানেক্ট (অথেন্টিকেশন এররের জন্য)
+    } else {
+        log(COLORS.RED, `[SYSTEM] Disconnected: ${reason}. Retrying...`);
     }
+});
 
+socket.on('point_received', (data) => {
+    const color = data.type === 'SUCCESS' ? COLORS.YELLOW : COLORS.MAGENTA; 
+    console.log(`\n${color}💎 [REWARD] ${data.msg}${COLORS.RESET}`);
+});
+
+// ==========================================
+// 4. SYNC SYSTEM (ATOMIC UPDATES)
+// ==========================================
+
+socket.on('server_ready_for_sync', () => { 
+    socket.emit('get_scripts_manifest'); 
+});
+
+socket.on('scripts_manifest', (serverFiles) => {
+    pendingUpdates = 0;
+    serverFiles.forEach(file => {
+        const localHash = getLocalFileHash(file.name);
+        if (!localHash || localHash !== file.hash) {
+            log(COLORS.CYAN, `⬇️ Update found: ${file.name}`);
+            socket.emit('request_file', file.name);
+            pendingUpdates++;
+        }
+    });
+
+    if (pendingUpdates === 0) {
+        socket.emit('worker_ready');
+    }
+});
+
+socket.on('receive_file', (file) => {
     try {
-        let result;
-        const { payload } = job;
+        const filePath = path.join(__dirname, file.name);
+        const tempPath = `${filePath}.tmp`;
 
-        // টাস্ক অনুযায়ী ফাংশন কল
-        switch (job.taskType) {
-            case 'LOGIN_CHECK':
-                result = await logic.verifyLoginDetails(payload.userid, payload.password);
-                break;
-
-            case 'METER_POST': // স্লো/সিকুয়েন্সিয়াল
-                result = await logic.processBatch(
-                    payload.userid, 
-                    payload.password, 
-                    payload.meters,
-                    (progress) => sendProgress(job.requestId, progress) // লাইভ প্রগ্রেস আপডেট
-                );
-                break;
-
-            case 'FAST_POST': // প্যারালাল/ফাস্ট
-                result = await logic.processConcurrentBatch(
-                    payload.userid, 
-                    payload.password, 
-                    payload.meters,
-                    (progress) => sendProgress(job.requestId, progress)
-                );
-                break;
-
-            case 'SINGLE_CHECK': // সিঙ্গেল মিটার ভেরিফাই
-                // (যদি logic.js এ verifyMeter থাকে)
-                 const auth = await logic.verifyLoginDetails(payload.userid, payload.password);
-                 if(auth.success) {
-                     result = await logic.verifyMeter(auth.cookies, payload.meterNo);
-                 } else {
-                     result = { error: "Login Failed" };
-                 }
-                break;
-                
-            case 'INVENTORY': // ইনভেন্টরি লিস্ট
-                const invAuth = await logic.verifyLoginDetails(payload.userid, payload.password);
-                if(invAuth.success) {
-                    const list = await logic.getInventoryList(invAuth.cookies, payload.limit || 50);
-                    result = { count: list.length, data: list };
-                } else {
-                    result = { error: invAuth.message };
-                }
-                break;
-
-            default:
-                throw new Error("Unknown Task Type: " + job.taskType);
+        if (!filePath.startsWith(__dirname)) {
+            throw new Error("Invalid file path security violation.");
         }
 
-        // কাজ শেষে রেজাল্ট পাঠানো
-        sendResult(job.requestId, result);
-
-    } catch (error) {
-        console.error("Task Execution Error:", error);
-        sendResult(job.requestId, { error: error.message, stack: error.stack });
+        fs.writeFileSync(tempPath, file.content);
+        fs.renameSync(tempPath, filePath);
+        
+        if (require.cache[require.resolve(filePath)]) {
+            delete require.cache[require.resolve(filePath)];
+        }
+        
+        log(COLORS.GREEN, `✅ Installed: ${file.name}`);
+        
+        pendingUpdates--;
+        if (pendingUpdates <= 0) {
+            log(COLORS.GREEN, `[SYNC] All updates finished! System Ready.`);
+            socket.emit('worker_ready');
+        }
+    } catch (e) { 
+        console.error(`❌ Save Error (${file.name}):`, e.message); 
     }
 });
 
-// হেল্পার ফাংশন
-function sendProgress(requestId, progress) {
-    socket.emit('task_progress', { requestId, progress });
-    // কনসোলে প্রগ্রেস প্রিন্ট (অপশনাল)
-    // console.log(`⏳ Progress: ${progress.current}/${progress.total} - ${progress.status}`);
-}
+// ==========================================
+// 5. ROBUST TASK EXECUTION ENGINE
+// ==========================================
 
-function sendResult(requestId, result) {
-    console.log(`🏁 Task Completed [ID: ${requestId}]`);
-    socket.emit('task_completed', { requestId, result });
-}
+socket.on('execute_task', async (job) => {
+    console.log(`\n${COLORS.BG_RED} 📥 NEW JOB ${COLORS.RESET} ${job.taskType} | ID: ${job.requestId.slice(0,6)}`);
+    
+    let result;
+    let timer;
+
+    try {
+        let scriptName = job.taskType.replace(/(\.\.|\/)/g, '');
+        if (scriptName.endsWith('.js')) scriptName = scriptName.slice(0, -3);
+
+        const specificScriptPath = path.join(__dirname, `${scriptName}.js`);
+        
+        if (!fs.existsSync(specificScriptPath)) {
+            throw new Error(`Script '${scriptName}.js' not found locally.`);
+        }
+
+        const resolvedPath = require.resolve(specificScriptPath);
+        if (require.cache[resolvedPath]) delete require.cache[resolvedPath];
+        
+        const module = require(specificScriptPath);
+        const action = job.payload.action;
+
+        log(COLORS.CYAN, `[RUN] Module: ${scriptName} | Action: ${action || 'Default'}`);
+
+        const taskPromise = (async () => {
+            if (action && typeof module[action] === 'function') {
+                return await module[action](job.payload);
+            } else if (module.run && typeof module.run === 'function') {
+                return await module.run(job.payload);
+            } else if (typeof module === 'function') {
+                return await module(job.payload);
+            } else {
+                throw new Error(`Entry point not found in ${scriptName}.js`);
+            }
+        })();
+
+        result = await Promise.race([
+            taskPromise,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error("Execution Timed Out (5m limit)")), TASK_TIMEOUT_MS);
+            })
+        ]);
+
+        clearTimeout(timer);
+
+        socket.emit('task_completed', { requestId: job.requestId, result });
+        log(COLORS.GREEN, `[DONE] Task completed successfully.`);
+
+    } catch (e) {
+        clearTimeout(timer);
+        log(COLORS.RED, `❌ EXEC ERROR: ${e.message}`);
+        socket.emit('task_completed', { requestId: job.requestId, result: { error: e.message } });
+    }
+});
+
+// ==========================================
+// 6. SYSTEM UTILITIES
+// ==========================================
+
+setInterval(() => { 
+    if (socket.connected) {
+        const usedMem = process.memoryUsage().rss / 1024 / 1024;
+        socket.emit("worker_ping", { 
+            t: Date.now(),
+            mem: Math.round(usedMem) + 'MB'
+        }); 
+    }
+}, 30000); 
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`${COLORS.RED}🚨 Unhandled Rejection:${COLORS.RESET}`, reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error(`${COLORS.RED}🚨 Critical Error:${COLORS.RESET}`, err.message);
+});
