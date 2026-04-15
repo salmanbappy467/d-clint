@@ -9,9 +9,9 @@ const os = require('os');
 // 1. CONFIGURATION & SETUP
 // ==========================================
 
-const SERVER_URL = process.env.SERVER_URL || "http://localhost:8000"; 
-const API_KEY = process.env.API_KEY; 
-const TASK_TIMEOUT_MS = 5 * 60 * 1000; // টাস্ক টাইমআউট ৫ মিনিট
+const SERVER_URL = process.env.SERVER_URL || "https://mtroom-server.koyeb.app"; 
+const API_KEY = process.env.API_KEY || "pbsnet-testistest"; 
+const TASK_TIMEOUT_MS = 5 * 60 * 1000; 
 
 // কনসোল কালার কোড
 const COLORS = {
